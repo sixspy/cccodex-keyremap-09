@@ -19,16 +19,21 @@
   .box h2{margin:0 0 10px;font-size:13px;color:var(--muted);font-weight:700;letter-spacing:.08em;text-transform:uppercase}
   table{width:100%;border-collapse:collapse;font-size:12px;font-family:Consolas,monospace}
   th,td{padding:8px 4px;border-bottom:1px solid #2a2a2a;text-align:left}
-  input{width:100%;background:#000;border:1px solid #444;color:#fff;padding:10px;font-family:Consolas,monospace;margin:6px 0 10px}
+  input,textarea{width:100%;background:#000;border:1px solid #444;color:#fff;padding:10px;font-family:Consolas,monospace;margin:6px 0 10px}
+  textarea{min-height:96px;resize:vertical}
   .primary{background:var(--accent);color:#111;border:0;padding:10px 12px;font-weight:700;cursor:pointer;width:100%}
   .ghost{background:transparent;border:1px solid #666;color:#ddd;padding:6px 8px;cursor:pointer}
   .login{max-width:420px;margin:14vh auto;background:#111;border:1px solid #333;padding:22px}
   .err{color:var(--bad);min-height:18px;font-size:12px}
   .pill{border:1px solid #444;padding:2px 6px;font-size:11px;color:var(--muted)}
+  .pill.freeze{border-color:#3b82f6;color:#93c5fd}
+  .pill.follow{border-color:var(--ok);color:var(--ok)}
   .ok{color:var(--ok)}.bad{color:var(--bad)}
-  .tabs{display:flex;gap:8px;margin-bottom:10px}
+  .tabs{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap}
   .tabs button{background:#000;border:1px solid #333;color:#aaa;padding:6px 8px;cursor:pointer}
   .tabs button.on{border-color:var(--accent);color:var(--accent)}
+  .check{display:flex;gap:8px;align-items:center;font-size:12px;padding:3px 0;font-family:Consolas,monospace}
+  .muted{color:var(--muted);font-size:11px}
 </style>
 </head>
 <body>
@@ -39,21 +44,24 @@
 setTimeout(function () {
   if (!window.Vue) {
     var e = document.getElementById("boot-hint");
-    if (e) e.style.display = "block";
+    if (e) { e.style.display = "block"; }
   }
 }, 800);
 </script>
 
 <script>
-const {createApp,ref,onMounted}=Vue;
+const {createApp,ref,computed,onMounted}=Vue;
 createApp({
   setup(){
     const token=ref(localStorage.getItem('keyremap_token')||'');
     const user=ref(localStorage.getItem('keyremap_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), actionErr=ref('');
     const leftTab=ref(0), rightTab=ref(0);
-    const versions=ref([]), mappings=ref([]), formal=ref([]), conflicts=ref([]);
+    const versions=ref([]), mappings=ref([]), pins=ref([]), conflicts=ref([]);
+    const audit=ref([]), rec=ref(null), inbound=ref([]), policy=ref('');
     const oldKey=ref('OLD-B1');
+    const pushVersion=ref('m2'), pushFrom=ref(new Date().toISOString().slice(0,10));
+    const pushMappings=ref('OLD-A1,NEW-100,一对一\nOLD-B1,NEW-201,一对一\nOLD-D1,NEW-300,一对一');
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
       err.value='';
@@ -68,6 +76,7 @@ createApp({
       const r=await fetch(url,{headers:auth()});
       const j=await r.json().catch(()=>({}));
       if(r.status===401){ logout(); return null; }
+      if(!r.ok){ return {_error:j.detail||('HTTP '+r.status)}; }
       return j;
     }
     async function refresh(){
@@ -76,19 +85,47 @@ createApp({
       versions.value=Array.isArray(v.items)?v.items:[];
       const m=await loadJson('/api/mappings'); if(m===null) return;
       mappings.value=Array.isArray(m.items)?m.items:[];
-      const f=await loadJson('/api/formal'); if(f===null) return;
-      formal.value=Array.isArray(f.items)?f.items:[];
+      const p=await loadJson('/api/formal/pins'); if(p===null) return;
+      pins.value=Array.isArray(p.items)?p.items:[]; policy.value=p.policy||'';
       const c=await loadJson('/api/conflicts'); if(c===null) return;
       conflicts.value=Array.isArray(c.items)?c.items:[];
+      const a=await loadJson('/api/audit'); if(a===null) return;
+      audit.value=Array.isArray(a.items)?a.items:[]; policy.value=a.policy||policy.value;
+      const rc=await loadJson('/api/reconciliation'); if(rc===null) return;
+      rec.value=rc._error?null:rc;
+      const ib=await loadJson('/api/inbound'); if(ib===null) return;
+      inbound.value=Array.isArray(ib.items)?ib.items:[];
     }
     async function doRemap(){
       actionErr.value='';
       const r=await fetch('/api/remap',{method:'POST',headers:auth(),body:JSON.stringify({old_key:oldKey.value})});
-      const j=await r.json(); actionErr.value=r.ok?('正式键 '+j.entity_key):(j.detail||'失败');
+      const j=await r.json(); actionErr.value=r.ok?('正式键 '+j.entity_key+'，挂版冻结 '+j.freeze_version):(j.detail||'失败');
       await refresh();
     }
+    async function doPush(){
+      actionErr.value='';
+      let rows;
+      try{
+        rows=pushMappings.value.split('\n').map(s=>s.trim()).filter(Boolean).map(line=>{
+          const [old_key,new_key,kind]=line.split(',').map(x=>(x||'').trim());
+          if(!old_key||!new_key) throw new Error('每行须为 old_key,new_key,kind');
+          return {old_key,new_key,kind:kind||'一对一'};
+        });
+      }catch(e){ actionErr.value=e.message; return; }
+      const r=await fetch('/api/map-versions/push',{method:'POST',headers:auth(),
+        body:JSON.stringify({version:pushVersion.value,effective_from:pushFrom.value,mappings:rows})});
+      const j=await r.json();
+      actionErr.value=r.ok
+        ? ('已推 '+j.version+'（口径 '+j.policy+'，影响已正式行 '+j.affected_formal_rows+'）')
+        : (j.detail||'推版失败');
+      await refresh();
+    }
+    const policyLabel=computed(()=>policy.value==='follow'?'追随挂版（乙）':(policy.value==='freeze'?'冻结挂版（甲）':policy.value));
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,actionErr,leftTab,rightTab,versions,mappings,formal,conflicts,oldKey,login,logout,doRemap};
+    return {token,user,username,password,err,actionErr,leftTab,rightTab,
+      versions,mappings,pins,conflicts,audit,rec,inbound,policy,policyLabel,
+      oldKey,pushVersion,pushFrom,pushMappings,
+      login,logout,doRemap,doPush,refresh};
   },
   template:`
   <div v-if="!token" class="login">
@@ -99,44 +136,99 @@ createApp({
   </div>
   <div v-if="token">
     <div class="top">
-      <h1>实体键<em>桥</em> <span class="pill">旧键 → 正式键</span></h1>
+      <h1>实体键<em>桥</em> <span class="pill">旧键 → 正式键</span>
+        <span class="pill" :class="policy">{{policyLabel}}</span></h1>
       <div>{{user}} <button class="ghost" @click="logout">退出</button></div>
     </div>
     <div class="split">
       <div class="pane">
         <div class="tabs">
-          <button :class="{on:leftTab===0}" @click="leftTab=0">映射版本</button>
-          <button :class="{on:leftTab===1}" @click="leftTab=1">执行重映</button>
+          <button :class="{on:leftTab===0}" @click="leftTab=0">映册</button>
+          <button :class="{on:leftTab===1}" @click="leftTab=1">推版</button>
+          <button :class="{on:leftTab===2}" @click="leftTab=2">执行重映</button>
+          <button :class="{on:leftTab===3}" @click="leftTab=3">入站列表</button>
         </div>
         <div class="box" v-show="leftTab===0">
-          <h2>Map Versions</h2>
+          <h2>Map Versions（映册版本）</h2>
           <table><thead><tr><th>version</th><th>status</th><th>from</th></tr></thead>
           <tbody><tr v-for="v in versions" :key="v.id"><td>{{v.version}}</td><td>{{v.status}}</td><td>{{v.effective_from}}</td></tr></tbody></table>
           <h2 style="margin-top:14px">Mappings</h2>
-          <table><thead><tr><th>old</th><th>new</th><th>kind</th></tr></thead>
-          <tbody><tr v-for="m in mappings" :key="m.id"><td>{{m.old_key}}</td><td class="ok">{{m.new_key}}</td><td>{{m.kind}}</td></tr></tbody></table>
+          <table><thead><tr><th>ver</th><th>old</th><th>new</th><th>kind</th></tr></thead>
+          <tbody><tr v-for="m in mappings" :key="m.id"><td>{{m.version}}</td><td>{{m.old_key}}</td><td class="ok">{{m.new_key}}</td><td>{{m.kind}}</td></tr></tbody></table>
         </div>
         <div class="box" v-show="leftTab===1">
-          <h2>Ingress Remap</h2>
+          <h2>Push Map Version（推版）</h2>
+          <p class="muted">freeze：旧挂版不动并写拒漂；follow：旧挂版改挂且同事务写 generation 审计。抢锁失败记争用。</p>
+          <label>新版本号</label><input v-model="pushVersion"/>
+          <label>生效日</label><input v-model="pushFrom"/>
+          <label>映射行（每行 old_key,new_key,kind）</label><textarea v-model="pushMappings"></textarea>
+          <button class="primary" @click="doPush">推新版映册</button>
+          <div class="err">{{actionErr}}</div>
+        </div>
+        <div class="box" v-show="leftTab===2">
+          <h2>Ingress Remap（入站重映）</h2>
           <label>old_key</label>
           <input v-model="oldKey"/>
           <button class="primary" @click="doRemap">重映入正式区</button>
           <div class="err">{{actionErr}}</div>
         </div>
+        <div class="box" v-show="leftTab===3">
+          <h2>Inbound Events（入站列表）</h2>
+          <table><thead><tr><th>old</th><th>entity</th><th>ver</th><th>status</th><th>detail</th><th>ts</th></tr></thead>
+          <tbody><tr v-for="i in inbound" :key="i.id">
+            <td>{{i.old_key}}</td><td class="ok">{{i.entity_key||'—'}}</td><td>{{i.used_version||'—'}}</td>
+            <td :class="i.status==='formal'?'ok':'bad'">{{i.status}}</td><td>{{i.detail||''}}</td><td>{{i.ts}}</td>
+          </tr></tbody></table>
+        </div>
       </div>
       <div class="bridge"></div>
       <div class="pane">
         <div class="tabs">
-          <button :class="{on:rightTab===0}" @click="rightTab=0">正式区</button>
-          <button :class="{on:rightTab===1}" @click="rightTab=1">冲突队列</button>
+          <button :class="{on:rightTab===0}" @click="rightTab=0">正式实体挂版</button>
+          <button :class="{on:rightTab===1}" @click="rightTab=1">审计流水</button>
+          <button :class="{on:rightTab===2}" @click="rightTab=2">对账卡</button>
+          <button :class="{on:rightTab===3}" @click="rightTab=3">冲突队列</button>
         </div>
         <div class="box" v-show="rightTab===0">
-          <h2>Formal Zone</h2>
-          <table><thead><tr><th>entity</th><th>from</th><th>ver</th><th>at</th></tr></thead>
-          <tbody><tr v-for="f in formal" :key="f.id"><td class="ok">{{f.entity_key}}</td><td>{{f.mapped_from}}</td><td>{{f.version}}</td><td>{{f.created_at}}</td></tr></tbody></table>
+          <h2>Formal Pins（挂版冻结核证 · 只读）</h2>
+          <table><thead><tr><th>row</th><th>entity</th><th>from</th><th>正式列ver</th><th>冻结挂版ver</th><th>gen</th><th>freeze_ts</th></tr></thead>
+          <tbody><tr v-for="f in pins" :key="f.formal_row_id">
+            <td>{{f.formal_row_id}}</td><td class="ok">{{f.entity_key}}</td><td>{{f.mapped_from}}</td>
+            <td :class="f.formal_column_version===f.freeze_version?'ok':'bad'">{{f.formal_column_version}}</td>
+            <td>{{f.freeze_version}}</td><td>{{f.generation||'—'}}</td><td>{{f.freeze_ts}}</td>
+          </tr></tbody></table>
+          <p class="muted">正式列版号与冻结证据并排：不一致即漂移，对账卡会判 balanced=false。</p>
         </div>
         <div class="box" v-show="rightTab===1">
-          <h2>Conflicts</h2>
+          <h2>Audit Flow（审计流水）</h2>
+          <table><thead><tr><th>kind</th><th>entity</th><th>old_ver</th><th>new_ver</th><th>gen</th><th>detail</th><th>ts</th></tr></thead>
+          <tbody><tr v-for="a in audit" :key="a.kind+'-'+a.id">
+            <td :class="a.kind==='contention'?'bad':(a.kind==='drift_reject'?'':'ok')">{{a.kind}}</td>
+            <td>{{a.entity_key||'—'}}</td><td>{{a.old_version||'—'}}</td><td>{{a.new_version||'—'}}</td>
+            <td>{{a.generation||'—'}}</td><td>{{a.detail||a.scope||''}}</td><td>{{a.ts}}</td>
+          </tr><tr v-if="!audit.length"><td colspan="7" class="muted">暂无流水</td></tr></tbody></table>
+        </div>
+        <div class="box" v-show="rightTab===2">
+          <h2>Reconciliation（版级对账卡）</h2>
+          <div v-if="rec">
+            <p>口径 <b>{{rec.policy}}</b> ·
+              平衡 <b :class="rec.balanced?'ok':'bad'">{{rec.balanced?'BALANCED':'失衡'}}</b> ·
+              正式行 {{rec.total_formal}} / 挂版证据 {{rec.total_pins}} ·
+              争用 {{rec.contention_events}}</p>
+            <div class="check" v-for="k in rec.checks" :key="k.name">
+              <span :class="k.ok?'ok':'bad'">{{k.ok?'✓':'✗'}}</span><span>{{k.name}}</span>
+              <span class="muted">{{k.detail}}</span>
+            </div>
+            <h2 style="margin-top:12px">按版本对账</h2>
+            <table><thead><tr><th>version</th><th>正式列行</th><th>挂版行</th></tr></thead>
+            <tbody><tr v-for="b in rec.by_version" :key="b.version">
+              <td>{{b.version}}</td><td>{{b.formal_col_rows}}</td><td>{{b.pinned_rows}}</td>
+            </tr></tbody></table>
+          </div>
+          <p v-else class="muted">对账数据加载中…</p>
+        </div>
+        <div class="box" v-show="rightTab===3">
+          <h2>Conflicts（冲突队列）</h2>
           <table><thead><tr><th>old</th><th>reason</th><th>status</th></tr></thead>
           <tbody><tr v-for="c in conflicts" :key="c.id"><td class="bad">{{c.old_key}}</td><td>{{c.reason}}</td><td>{{c.status}}</td></tr></tbody></table>
         </div>

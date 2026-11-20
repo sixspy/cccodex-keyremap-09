@@ -49,3 +49,34 @@ python -m pip install -r requirements.txt
 python -m uvicorn app:app --app-dir backend --host 127.0.0.1 --port 10604
 python -m pytest -q
 `
+
+## 挂版证据与推版口径（formal_version_pin）
+
+推版（m1 → m2）不得悄悄改写已正式实体行的挂版。挂版证据持久落在
+`entity_map_freeze(formal_row_id, entity_key, freeze_version, freeze_ts)`，
+与界面展示无关；正确性口径按库级 `pin_policy` 二选一，建库定型后不可翻转：
+
+| 口径 | 取值 | 推 m2 时旧正式行 | 同事务留痕 |
+|------|------|------------------|-----------|
+| 甲·冻结挂版（默认） | `PIN_POLICY=freeze` | 挂版保持 m1，仅新重映用 m2 | `freeze_drift_reject` 逐行拒漂；挂版表带 UPDATE/DELETE 不可变触发器 |
+| 乙·追随挂版 | `PIN_POLICY=follow` | 可改挂 m2 | `remap_generation` 逐行追加审计，失败则挂版与审计一并回滚 |
+
+单库只贯彻一种口径：`freeze` 库不写 generation 审计，`follow` 库不写拒漂，
+对账卡对混用直接判失衡。所有挂版/映册写经 `BEGIN IMMEDIATE` 显式锁，
+抢锁失败写 `write_contention` 后返回 409，禁止无留痕争用。
+
+接口（均需登录 Bearer）：
+
+- `POST /api/map-versions/push` 推新版映册（同事务完成推版与拒漂/改挂审计）
+- `GET  /api/formal/pins` 挂版冻结核证（只读，正式列版号与冻结证据并排）
+- `GET  /api/audit` 审计流水（generation / drift_reject / contention）
+- `GET  /api/reconciliation` 版级对账卡（balanced 与逐项 check）
+- `GET  /api/inbound` 入站列表（formal / conflict）
+
+夹具与验证：
+
+- `python fixtures/build_fixtures.py` 生成 `fixtures/fixture_freeze.db`（旧行仍挂 m1）
+  与 `fixtures/fixture_follow.db`（旧行挂 m2、generation 可查）
+- `python scripts/e2e_verify.py freeze|follow` 单库端到端核证
+- `python -m pytest -q` 含并发抢写争用、原子回滚、不可变触发器共 9 项
+
